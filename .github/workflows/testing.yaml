@@ -25,6 +25,22 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    env:
+      HTTPS_ENDPOINTS: >-
+        github.com:443
+        api.github.com:443
+        codeload.github.com:443
+        *.ubuntu.com:443
+        azure.archive.ubuntu.com:443
+        *.githubapp.com:443
+        *.githubusercontent.com:443
+        deb.debian.org:443
+        packages.microsoft.com:443
+        auth.docker.io:443
+        registry-1.docker.io:443
+        production.cloudflare.docker.com:443
+        production.cloudfront.docker.com:443
+        docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com:443
     strategy:
       fail-fast: false
       matrix:
@@ -35,20 +51,7 @@ jobs:
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
           egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            api.github.com:443
-            codeload.github.com:443
-            *.ubuntu.com:443
-            azure.archive.ubuntu.com:443
-            *.githubapp.com:443
-            *.githubusercontent.com:443
-            deb.debian.org:443
-            packages.microsoft.com:443
-            auth.docker.io:443
-            registry-1.docker.io:443
-            production.cloudflare.docker.com:443
-            docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com:443
+          allowed-endpoints: ${{ env.HTTPS_ENDPOINTS }}
 
       - name: "Verify block enforcement"
         shell: bash
@@ -92,13 +95,29 @@ jobs:
             = https/false/none
           sudo apt-get update --error-on=any
           shopt -s nullglob
+          parser="$GITHUB_WORKSPACE/apt-sources.awk"
           cd /etc/apt
           for file in sources.list sources.list.d/*.list \
-              sources.list.d/*.sources apt-mirrors.txt; do
+              sources.list.d/*.sources; do
             [[ -f "$file" ]] || continue
             if grep -Ev '^[[:space:]]*#' "$file" | grep -nF 'http://'; then
               exit 1
             fi
+            case "${file##*/}" in *[!A-Za-z0-9_.-]*) continue ;; esac
+            case "$file" in *.sources) kind=deb822 ;; *) kind=list ;; esac
+            mirrors=$(LC_ALL=C awk -v kind="$kind" -v mode=mirrors \
+              -f "$parser" "$file")
+            while IFS= read -r mirror; do
+              [[ -n "$mirror" ]] || continue
+              if [[ ! -f "$mirror" || ! -r "$mirror" ]]; then
+                printf 'Cannot read APT mirror list: %s\n' "$mirror" >&2
+                exit 1
+              fi
+              if grep -Ev '^[[:space:]]*#' "$mirror" | grep -nF 'http://'; then
+                printf 'HTTP remains in APT mirror list: %s\n' "$mirror" >&2
+                exit 1
+              fi
+            done <<< "$mirrors"
           done
 
       - name: "Validate pinned Ubuntu and Debian containers"
@@ -114,6 +133,56 @@ jobs:
           test -f "$BOOTSTRAP"
           action_dir=$(dirname "$BOOTSTRAP")
           host_ca=/etc/ssl/certs/ca-certificates.crt
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) printf 'Unsupported runner architecture: %s\n' "$RUNNER_ARCH" >&2
+               exit 1 ;;
+          esac
+          registry_get() {
+            curl --fail --silent --show-error --proto '=https' --max-time 30 \
+              --header @- "$@" <<< "Authorization: Bearer $token"
+          }
+          accept='application/vnd.oci.image.index.v1+json'
+          accept+=', application/vnd.docker.distribution.manifest.list.v2+json'
+          accept+=', application/vnd.oci.image.manifest.v1+json'
+          accept+=', application/vnd.docker.distribution.manifest.v2+json'
+          for image in "$UBUNTU" "$DEBIAN"; do
+            repo="library/${image%@*}"
+            registry="https://registry-1.docker.io/v2/$repo"
+            token=$(curl --fail --silent --show-error --max-time 30 --get \
+              --data-urlencode 'service=registry.docker.io' \
+              --data-urlencode "scope=repository:$repo:pull" \
+              https://auth.docker.io/token | jq -er '.token')
+            manifest=$(registry_get --header "Accept: $accept" \
+              "$registry/manifests/${image#*@}" | jq -er --arg arch "$arch" '
+                first(.manifests[] | select(.platform.os == "linux"
+                  and .platform.architecture == $arch) | .digest)')
+            config=$(registry_get --header "Accept: $accept" \
+              "$registry/manifests/$manifest" | jq -er '.config.digest')
+            # Do not follow the redirect or log its signed URL.
+            response=$(registry_get --output /dev/null \
+              --write-out '%{http_code} %{redirect_url}' \
+              "$registry/blobs/$config")
+            redirect=${response#* }
+            if [[ "$redirect" =~ ^https://([A-Za-z0-9.-]+)(:443)?/ ]]; then
+              host=${BASH_REMATCH[1],,}
+              printf '%s (%s) config blob redirects to %s\n' \
+                "$image" "$arch" "$host"
+              if [[ " $HTTPS_ENDPOINTS " != *" $host:443 "* ]]; then
+                printf 'Docker Hub redirect host %s:443 is not allow-listed\n' \
+                  "$host" >&2
+                exit 1
+              fi
+            elif [[ "$response" == '200 ' ]]; then
+              printf '%s (%s) config blob served directly by %s\n' \
+                "$image" "$arch" registry-1.docker.io
+            else
+              printf 'Unexpected config response for %s (HTTP %s)\n' \
+                "$image" "${response%% *}" >&2
+              exit 1
+            fi
+          done
           for image in "$UBUNTU" "$DEBIAN"; do
             docker run --rm \
               --mount "type=bind,src=$action_dir,dst=/action,readonly" \
