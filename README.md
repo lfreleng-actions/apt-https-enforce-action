@@ -33,7 +33,9 @@ Comments, signing options and non-HTTP URIs stay intact.
 On GitHub's Ubuntu runners, an APT source can point to
 `mirror+file:/etc/apt/apt-mirrors.txt` rather than to an HTTP endpoint.
 The mirror list can include `azure.archive.ubuntu.com` and the Canonical
-archive on amd64; Ubuntu arm64 uses `ports.ubuntu.com`. The
+archive on amd64. The Ubuntu arm64 image uses `ports.ubuntu.com` and
+ships `/etc/apt/apt-mirrors.txt` with `http://` entries, but no APT source
+names that file, so the action leaves it untouched. The
 **Record the hosted image's APT sources** CI step logs the image version
 and actual source files on each architecture before the action changes them.
 
