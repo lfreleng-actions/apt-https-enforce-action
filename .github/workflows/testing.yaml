@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Action test/validation workflow
-name: "Test GitHub Action 🧪"
+name: "Test APT HTTPS"
 
 # yamllint disable-line rule:truthy
 on:
@@ -20,71 +19,202 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
-    runs-on: ubuntu-latest
+  https:
+    name: "HTTPS only (${{ matrix.runner }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
-        with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
-
-      # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (HTTPS-only block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
-          egress-policy: 'block'
+          egress-policy: block
           allowed-endpoints: >
-            ${{ env.CONNECTION_ALLOW_LIST }}
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            *.ubuntu.com:443
+            azure.archive.ubuntu.com:443
+            *.githubapp.com:443
+            *.githubusercontent.com:443
+            deb.debian.org:443
+            packages.microsoft.com:443
+            auth.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+            docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com:443
+
+      - name: "Verify block enforcement"
+        shell: bash
+        run: |
+          # An unlisted hostname should resolve to the agent's sinkhole.
+          resolved=$(getent ahostsv4 ubuntu.com)
+          test "${resolved%% *}" = 54.185.253.63
 
       - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Record the hosted image's APT sources"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Image: %s (%s, %s)\n' \
+            "$ImageOS" "$ImageVersion" "$RUNNER_ARCH"
+          cd /etc/apt
+          for file in sources.list sources.list.d/*.list \
+              sources.list.d/*.sources apt-mirrors.txt; do
+            if [[ -f "$file" ]]; then
+              printf '\n%s:\n' "$file"
+              cat "$file"
+            fi
+          done
 
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "Enforce HTTPS"
         uses: $/
-        with:
-          input: "test input 💬"
+        id: apt
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Validate runner APT"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          TRANSPORT: ${{ steps.apt.outputs.transport }}
+          FALLBACK_ENABLED: ${{ steps.apt.outputs.fallback_enabled }}
+          FALLBACK_SOURCE: ${{ steps.apt.outputs.fallback_source }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          test "$TRANSPORT/$FALLBACK_ENABLED/$FALLBACK_SOURCE" \
+            = https/false/none
+          sudo apt-get update --error-on=any
+          shopt -s nullglob
+          cd /etc/apt
+          for file in sources.list sources.list.d/*.list \
+              sources.list.d/*.sources apt-mirrors.txt; do
+            [[ -f "$file" ]] || continue
+            if grep -Ev '^[[:space:]]*#' "$file" | grep -nF 'http://'; then
+              exit 1
+            fi
+          done
 
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - name: "Validate pinned Ubuntu and Debian containers"
+        shell: bash
+        env:
+          BOOTSTRAP: ${{ steps.apt.outputs.container_bootstrap }}
+          # Multi-architecture indexes from the upstream allow-list probe.
+          # yamllint disable rule:line-length
+          UBUNTU: ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+          DEBIAN: debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+          # yamllint enable rule:line-length
+        run: |
+          test -f "$BOOTSTRAP"
+          action_dir=$(dirname "$BOOTSTRAP")
+          host_ca=/etc/ssl/certs/ca-certificates.crt
+          for image in "$UBUNTU" "$DEBIAN"; do
+            docker run --rm \
+              --mount "type=bind,src=$action_dir,dst=/action,readonly" \
+              --mount "type=bind,src=$host_ca,dst=/run/host-ca.pem,readonly" \
+              "$image" sh "/action/$(basename "$BOOTSTRAP")" /run/host-ca.pem
+          done
+
+  fallback:
+    name: "Fallback (${{ matrix.runner }}, ${{ matrix.switch }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        switch: ["off", input, override, invalid]
+    steps:
+      - name: "Harden runner (audit)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
-          invalid_input: "Some garbage"
+          egress-policy: audit
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Test source parsing, CA bootstrap and annotations"
+        if: matrix.switch == 'off'
+        run: sh tests/apt-https.sh
+
+      - name: "Configure a loopback-only HTTP APT fixture"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          mkdir "$RUNNER_TEMP/apt-fixture" "$RUNNER_TEMP/saved-sources"
+          cd "$RUNNER_TEMP/apt-fixture"
+          : > Packages
+          gzip -k Packages
+          {
+            printf 'Date: %s\nSHA256:\n' "$(date -Ru)"
+            for index in Packages Packages.gz; do
+              checksum=$(sha256sum "$index")
+              printf ' %s %s %s\n' \
+                "${checksum%% *}" "$(wc -c < "$index")" "$index"
+            done
+          } > Release
+          # APT can read the empty flat repository over HTTP but cannot
+          # negotiate TLS on the same socket.
+          python3 -m http.server 18754 --bind 127.0.0.1 \
+            --directory "$RUNNER_TEMP/apt-fixture" \
+            > "$RUNNER_TEMP/http.log" 2>&1 &
+          curl --silent --fail --retry 5 --retry-connrefused \
+            --output /dev/null http://127.0.0.1:18754/
+          shopt -s nullglob
+          cd /etc/apt
+          for file in sources.list sources.list.d/*.list \
+              sources.list.d/*.sources; do
+            [[ -e "$file" ]] || continue
+            sudo mv "$file" "$RUNNER_TEMP/saved-sources/"
+          done
+          printf 'deb [trusted=yes] http://127.0.0.1:18754 ./\n' \
+            | sudo tee /etc/apt/sources.list
+          printf 'Acquire::Retries "0";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-test-loopback
+
+      - name: "Run the action with the selected switch"
+        uses: $/
+        id: apt
+        continue-on-error: >-
+          ${{ matrix.switch == 'off' || matrix.switch == 'invalid' }}
+        with:
+          http_fallback: ${{ matrix.switch == 'input' && 'true' || 'false' }}
+          # yamllint disable-line rule:line-length
+          http_fallback_override: ${{ matrix.switch == 'override' && 'true' || matrix.switch == 'invalid' && 'True' || '' }}
+
+      - name: "Verify failure or explicit downgrade"
+        shell: bash
+        env:
+          SWITCH: ${{ matrix.switch }}
+          OUTCOME: ${{ steps.apt.outcome }}
+          TRANSPORT: ${{ steps.apt.outputs.transport }}
+          FALLBACK_ENABLED: ${{ steps.apt.outputs.fallback_enabled }}
+          FALLBACK_SOURCE: ${{ steps.apt.outputs.fallback_source }}
+        run: |
+          http_request='"GET /(\./)?Release HTTP/'
+          case "$SWITCH" in
+            off|invalid)
+              test "$OUTCOME" = failure
+              if grep -E "$http_request" "$RUNNER_TEMP/http.log"; then
+                exit 1
+              fi
+              ;;
+            *)
+              actual="$OUTCOME/$TRANSPORT/$FALLBACK_ENABLED/$FALLBACK_SOURCE"
+              test "$actual" = "success/http/true/$SWITCH"
+              grep -E "$http_request" "$RUNNER_TEMP/http.log"
+              ;;
+          esac
+          grep -Fx 'deb [trusted=yes] http://127.0.0.1:18754 ./' \
+            /etc/apt/sources.list
